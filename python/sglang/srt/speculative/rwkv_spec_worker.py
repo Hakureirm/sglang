@@ -52,6 +52,16 @@ self-contained "Strategy A" implementation (manual snapshot/restore + a
 re-run-the-accepted-prefix commit, no upstream verify reuse) is kept below,
 renamed and unwired, as a fallback reference in case the backend addition
 above hits a wall — see the block comment before it.
+
+Speed (ADR-0006 (ii)): the draft's own K-1 step decode loop now runs through
+a hand-rolled, self-contained CUDA graph (see the "draft decode CUDA graph"
+section below), NOT sglang's shared ``DecodeCudaGraphRunner`` -- that class
+hardcodes ``capture_forward_mode=TARGET_VERIFY`` for any draft worker under
+any speculative algorithm (an EAGLE-family assumption incompatible with a
+plain recurrent per-step draft) and is deliberately left untouched (shared,
+high-blast-radius file). The custom graph lives entirely in this file, is
+built lazily on first use, and falls back to the pre-existing eager path
+(unchanged) on any capture failure or via ``RWKV_SPEC_DRAFT_GRAPH=0``.
 """
 
 import logging
@@ -154,18 +164,22 @@ class RwkvSpecWorker(BaseSpecWorker):
         self.speculative_num_draft_tokens = self.k
 
         # The draft loads speculative_draft_model_path (TpModelWorker resolves it
-        # via is_draft_worker). Force its context to the target's; keep it eager
-        # for now — draft-decode cuda graphs are a speed follow-up (tried and
-        # reverted: DecodeCudaGraphRunner.__init__ hardcodes capture_forward_
-        # mode=TARGET_VERIFY for ANY draft worker under ANY speculative algorithm
-        # (model_executor/runner/decode_cuda_graph_runner.py ~L249-251), an
-        # EAGLE-shaped assumption our plain recurrent per-step draft doesn't
-        # match — RuntimeError("This should not happen") since RwkvSpecAlgo
-        # doesn't (and semantically shouldn't) implement supports_target_verify_
-        # for_draft. See project-spec-decode.md 2026-07-07 entry for the two
-        # real paths forward (custom capture vs. shared-file surgery) — this
-        # needs a repo-wide-impact decision, not a quick fix, so left for a
-        # dedicated follow-up rather than pushed through here.
+        # via is_draft_worker). Force its context to the target's. Keep the
+        # DRAFT'S OWN TpModelWorker built with disable_cuda_graph=True always —
+        # this only opts it out of sglang's *generic* DecodeCudaGraphRunner,
+        # which hardcodes capture_forward_mode=TARGET_VERIFY for ANY draft
+        # worker under ANY speculative algorithm (model_executor/runner/
+        # decode_cuda_graph_runner.py ~L249-253), an EAGLE-shaped assumption
+        # our plain recurrent per-step draft doesn't match — RuntimeError(
+        # "This should not happen") since RwkvSpecAlgo doesn't (and
+        # semantically shouldn't) implement supports_target_verify_for_draft.
+        # Speed instead comes from a SEPARATE, hand-rolled CUDA graph owned by
+        # this file (see "draft decode CUDA graph" below) that captures the
+        # draft's own ForwardMode.DECODE K-1 step loop directly via
+        # torch.cuda.graph(), bypassing ModelRunner.init_cuda_graphs/
+        # DecodeCudaGraphRunner entirely — so this disable_cuda_graph=True
+        # stays exactly as it was (still correctly opting out of the shared,
+        # incompatible generic mechanism).
         server_args.context_length = self.target_runner.model_config.context_len
         with _preserve(server_args, "disable_cuda_graph", True):
             self._draft = TpModelWorker(
@@ -196,10 +210,21 @@ class RwkvSpecWorker(BaseSpecWorker):
         self._prev_decode_rids: set = set()
         self._rounds = 0
         self._accept_sum = 0
+        # Draft decode CUDA graph (ADR-0006 (ii), speed): built lazily on the
+        # first real decode round (needs a live batch/req template + an
+        # already-allocated draft pool). None until built; _draft_graph_failed
+        # latches permanently true after any capture failure so we don't retry
+        # every round. See _ensure_draft_decode_graph / _build_draft_decode_graph.
+        self._draft_graph = None
+        self._draft_graph_io = None
+        self._draft_graph_failed = False
+        self._graph_scratch_shim = None
         logger.info(
-            "RWKV_SPEC up: draft=%s K=%d (Strategy B, eager, --disable-overlap-schedule)",
+            "RWKV_SPEC up: draft=%s K=%d (Strategy B, --disable-overlap-schedule, "
+            "draft-decode-graph=%s)",
             server_args.speculative_draft_model_path,
             self.k,
+            "lazy" if self._draft_graph_enabled() else "off (RWKV_SPEC_DRAFT_GRAPH=0)",
         )
 
     # ---- BaseSpecWorker surface -------------------------------------------- #
@@ -511,13 +536,25 @@ class RwkvSpecWorker(BaseSpecWorker):
         d_mslot = self._mamba_idx(self.draft_pool, draft_req_idx)
         cur_len = len(req.origin_input_ids) + len(req.output_ids)
 
+        # Lazily build the draft-decode CUDA graph on first use (needs a live
+        # batch/req as a one-time template — see _build_draft_decode_graph).
+        # Cheap no-op check on every later round; permanently falls back to
+        # the unchanged eager path (already gated 10/10) if capture ever
+        # fails, so this can never regress correctness, only speed.
+        use_graph = self._ensure_draft_decode_graph(batch, req)
+
         snaps = [_snapshot(self.draft_pool, self.draft_layers, d_mslot)]
         drafts: List[int] = []
         tok = t_last
         for step in range(self.k - 1):
-            logits = self._draft_decode_one_logits(
-                batch, req, draft_req_idx, tok, cur_len + step
-            )
+            if use_graph:
+                logits = self._draft_decode_one_logits_graphed(
+                    draft_req_idx, tok, cur_len + step + 1
+                )
+            else:
+                logits = self._draft_decode_one_logits(
+                    batch, req, draft_req_idx, tok, cur_len + step
+                )
             nxt = int(torch.argmax(logits, dim=-1))
             drafts.append(nxt)
             tok = nxt
@@ -573,6 +610,220 @@ class RwkvSpecWorker(BaseSpecWorker):
         )
         out = self.draft_runner.forward(fb)
         return out.logits_output.next_token_logits[0]
+
+    # ---- draft decode CUDA graph (speed; ADR-0006 (ii)) --------------------- #
+    #
+    # sglang's shared, generic DecodeCudaGraphRunner hardcodes
+    # capture_forward_mode=TARGET_VERIFY for ANY draft worker under ANY
+    # speculative algorithm (decode_cuda_graph_runner.py ~L249-253) -- an
+    # EAGLE-family assumption ("draft workers verify their own nested chain")
+    # incompatible with our plain recurrent per-step draft, and deliberately
+    # NOT patched here (shared file, blast radius far outside this task; the
+    # attempt + revert is documented in project-spec-decode.md 2026-07-07).
+    # Instead: a narrow, self-contained CUDA graph, owned entirely by this
+    # file, used ONLY for the draft's own K-1 step ForwardMode.DECODE loop
+    # (always bs=1/n=1 -- _verify_round drives one request's chain at a time).
+    #
+    # Standard PyTorch idiom (torch docs "CUDA Graphs"): pre-allocate static
+    # leaf tensors, warm up on a side stream long enough to trigger any lazy
+    # one-time setup inside the model (e.g. Rwkv7ChannelMix's M6 sparse-cmix
+    # tiled-weight build, which lazily builds+caches on the first bsz1-fp16-
+    # decode call), capture ONE call into a CUDAGraph, then on each later
+    # replay only overwrite the static buffers' CONTENTS (never their
+    # identity/address) and call graph.replay() -- the recorded kernels
+    # re-read the fresh values.
+    #
+    # What's safe to bake into the static buffers vs. what must stay eager
+    # (confirmed by reading hybrid_linear_attn_backend.py's _forward_metadata,
+    # not assumed):
+    #   - input_ids / seq_lens / req_pool_indices: pure data read by GPU ops
+    #     inside the captured region -- e.g. get_mamba_indices(req_pool_
+    #     indices) is a GPU gather over req_pool_indices's CURRENT contents,
+    #     not a value baked in at capture time -- safe to mutate via .fill_()
+    #     before every replay, including switching to a different request's
+    #     pool slot between rounds.
+    #   - out_cache_loc: comes from token_to_kv_pool_allocator.alloc(n), which
+    #     does its own non-replayable bookkeeping -- this call MUST stay
+    #     outside the graph, called eagerly every step exactly as the eager
+    #     path already does, with its result copied into a static buffer that
+    #     IS referenced inside the graph.
+    #   - seq_lens_cpu: a plain .cpu() sync -- confirmed unread anywhere on
+    #     the is_decode_or_idle() metadata path unless --enable-linear-
+    #     replayssm is on (we don't turn that on), so it is set once at build
+    #     time and never touched again. If some future change starts reading
+    #     it, that would surface as a gate failure or a capture-time error,
+    #     not a silent wrong answer.
+    #   - forward_batch.reqs[0] / other non-tensor `batch`-level fields: baked
+    #     in from whichever req/batch was passed to _build_draft_decode_graph
+    #     at build time. Fine for this worker's current draft path (uniform
+    #     config, no per-request LoRA on the draft) -- would need revisiting
+    #     if the draft ever needs a non-tensor field that varies per round.
+    #
+    # Correctness is proven by the SAME hard gate as everything else in this
+    # file (bench/spec_gate.py, spec-on == spec-off token-identical), not by
+    # this comment -- falls back to the unchanged eager path (still gated
+    # 10/10 on its own) on any capture-time failure, or via
+    # RWKV_SPEC_DRAFT_GRAPH=0.
+
+    def _draft_graph_enabled(self) -> bool:
+        import os
+
+        return os.environ.get("RWKV_SPEC_DRAFT_GRAPH", "1") != "0"
+
+    def _ensure_draft_decode_graph(self, batch, req) -> bool:
+        """Lazily build (once) the bs=1/n=1 DECODE-mode CUDA graph for the
+        draft's own per-step forward. Returns True iff the graph is ready to
+        use. No-op cost on every later round (single attribute check);
+        permanently False after a failed attempt (never retries mid-run)."""
+        if self._draft_graph is not None:
+            return True
+        if self._draft_graph_failed:
+            return False
+        if not self._draft_graph_enabled():
+            self._draft_graph_failed = True
+            return False
+        try:
+            self._build_draft_decode_graph(batch, req)
+            logger.info("RWKV_SPEC: draft decode CUDA graph captured OK")
+            return True
+        except Exception:
+            logger.warning(
+                "RWKV_SPEC: draft decode CUDA graph capture failed -- falling "
+                "back to eager draft decode for the rest of this run",
+                exc_info=True,
+            )
+            self._draft_graph = None
+            self._draft_graph_io = None
+            self._draft_graph_failed = True
+            return False
+
+    def _build_draft_decode_graph(self, batch, req) -> None:
+        """One-time capture. `batch`/`req` are only a TEMPLATE (their tensor
+        fields get overridden with static buffers below; only non-tensor
+        fields like dtype/model_config/tree_cache carry through as-is, same
+        as _build_forward already relies on for the eager path)."""
+        import dataclasses
+        import types
+
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+        )
+
+        runner = self.draft_runner
+        dev = runner.device
+
+        # Dedicated scratch mamba slot for warmup+capture ONLY -- never used
+        # by a real request, so the "practice" forward calls below (whose
+        # logits/state are discarded) cannot perturb any real request's
+        # recurrent state. Held for the worker's lifetime, never freed.
+        shim = types.SimpleNamespace(
+            rid="__rwkv_spec_draft_graph_scratch__",
+            req_pool_idx=None,
+            mamba_pool_idx=None,
+        )
+        scratch_idx = int(self.draft_pool.alloc([shim])[0])
+        self._graph_scratch_shim = shim  # keep alive (pool may key off identity)
+
+        g_input_ids = torch.zeros(1, dtype=torch.int64, device=dev)
+        g_req_pool_indices = torch.full(
+            (1,), scratch_idx, dtype=torch.int64, device=dev
+        )
+        g_seq_lens = torch.zeros(1, dtype=torch.int64, device=dev)
+
+        # Probe out_cache_loc's shape from a real allocator call (the same
+        # call the eager path already makes every step) before sizing the
+        # static buffer that will alias it inside the graph -- don't assume.
+        probe = runner.token_to_kv_pool_allocator.alloc(1)
+        assert probe is not None and probe.numel() == 1, (
+            "RWKV_SPEC draft graph: expected token_to_kv_pool_allocator.alloc(1) "
+            f"to return exactly one slot per token, got "
+            f"{None if probe is None else tuple(probe.shape)} -- refusing to "
+            "build a graph on an unverified assumption."
+        )
+        g_out_cache_loc = torch.zeros_like(probe)
+        g_out_cache_loc.copy_(probe)
+        # seq_lens_cpu must NOT be derived via a fresh .cpu() sync inside
+        # _one_step: that is a CPU<->CUDA copy, and CUDA graph capture
+        # explicitly forbids unpinned host copies during capture (confirmed
+        # empirically -- capture raised "Cannot copy between CPU and CUDA
+        # tensors during CUDA graph capture unless the CPU tensor is pinned").
+        # Use one fixed, plain CPU tensor instead: the is_decode_or_idle()
+        # metadata path only reads seq_lens_cpu behind the (disabled here)
+        # --enable-linear-replayssm branch (confirmed by reading
+        # hybrid_linear_attn_backend.py's _forward_metadata), so its value
+        # never needs to change across replays.
+        g_seq_lens_cpu_dummy = torch.zeros(1, dtype=torch.int64)
+
+        cur_len = len(req.origin_input_ids) + len(req.output_ids)
+
+        def _one_step(out_cache_loc_val, seq_len_after):
+            g_seq_lens.fill_(seq_len_after)
+            g_out_cache_loc.copy_(out_cache_loc_val)
+            overrides = dict(
+                reqs=[req],
+                req_to_token_pool=runner.req_to_token_pool,
+                token_to_kv_pool_allocator=runner.token_to_kv_pool_allocator,
+                req_pool_indices=g_req_pool_indices,
+                input_ids=g_input_ids,
+                seq_lens=g_seq_lens,
+                seq_lens_sum=int(seq_len_after),
+                seq_lens_cpu=g_seq_lens_cpu_dummy,
+                out_cache_loc=g_out_cache_loc,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+                sampling_info=None,
+                capture_hidden_mode=None,
+                return_hidden_states_before_norm=False,
+                return_logprob=False,
+                top_logprobs_nums=[0],
+                token_ids_logprobs=[None],
+            )
+            draft_batch = dataclasses.replace(batch, **overrides)
+            fb = ForwardBatch.init_new(draft_batch, runner)
+            return runner.forward(fb)
+
+        # Warmup on a side stream (standard idiom) -- long enough to trigger
+        # any lazy one-time module-level setup so it does NOT happen for the
+        # first time during capture (which would otherwise bake a one-off
+        # setup kernel sequence into the graph, or outright fail capture).
+        g_input_ids.fill_(0)
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for i in range(5):
+                ocl = runner.token_to_kv_pool_allocator.alloc(1)
+                _one_step(ocl, cur_len + 1 + i)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        g = torch.cuda.CUDAGraph()
+        ocl = runner.token_to_kv_pool_allocator.alloc(1)
+        with torch.cuda.graph(g):
+            static_out = _one_step(ocl, cur_len + 6)
+
+        self._draft_graph = g
+        self._draft_graph_io = dict(
+            input_ids=g_input_ids,
+            req_pool_indices=g_req_pool_indices,
+            seq_lens=g_seq_lens,
+            out_cache_loc=g_out_cache_loc,
+            out=static_out,
+        )
+
+    def _draft_decode_one_logits_graphed(self, draft_req_idx, token, seq_len_after):
+        """Graphed replacement for _draft_decode_one_logits: same inputs
+        (draft_req_idx = the REAL request's own pool slot, token = the id to
+        feed, seq_len_after = the sequence length once this token is
+        appended) and the same output shape, routed through the captured
+        bs=1 DECODE CUDA graph instead of an eager per-step forward."""
+        io = self._draft_graph_io
+        out_cache_loc = self.draft_runner.token_to_kv_pool_allocator.alloc(1)
+        io["input_ids"].fill_(token)
+        io["seq_lens"].fill_(seq_len_after)
+        io["req_pool_indices"].fill_(draft_req_idx)
+        io["out_cache_loc"].copy_(out_cache_loc)
+        self._draft_graph.replay()
+        return io["out"].logits_output.next_token_logits[0]
 
     def _draft_extend(self, batch, req, tokens, prefix_len):
         """Extend the draft's own pool with `tokens` (prompt-mirror path).
