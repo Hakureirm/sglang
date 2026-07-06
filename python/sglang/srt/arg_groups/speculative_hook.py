@@ -113,6 +113,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 
+        if server_args.speculative_algorithm.upper() == "RWKV_SPEC":
+            import sglang.srt.speculative.rwkv_spec_worker  # noqa: F401
         algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # TODO: move the per-algorithm validation below into spec module hooks.

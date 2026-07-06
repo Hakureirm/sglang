@@ -52,7 +52,11 @@ def get_draft_kv_pool(
 ):
     """Return the draft token-to-KV pool for the current draft worker,
     or None when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
+    if (
+        draft_worker is None
+        or spec_algorithm.is_ngram()
+        or getattr(draft_worker, "draft_worker", None) is None
+    ):  # no nested transformer draft -> no draft KV pool (recurrent draft)
         return None
 
     # V2 workers nest the draft runner under `.draft_worker`.

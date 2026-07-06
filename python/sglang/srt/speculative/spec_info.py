@@ -51,6 +51,8 @@ class SpeculativeAlgorithm(Enum):
             return cls[upper]
         except KeyError:
             pass
+        if upper == "RWKV_SPEC":
+            import sglang.srt.speculative.rwkv_spec_worker  # noqa: F401
         spec = _get_registered_spec(upper)
         if spec is not None:
             return spec
