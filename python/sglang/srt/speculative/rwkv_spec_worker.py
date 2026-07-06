@@ -155,7 +155,17 @@ class RwkvSpecWorker(BaseSpecWorker):
 
         # The draft loads speculative_draft_model_path (TpModelWorker resolves it
         # via is_draft_worker). Force its context to the target's; keep it eager
-        # for now — draft-decode cuda graphs are a speed follow-up.
+        # for now — draft-decode cuda graphs are a speed follow-up (tried and
+        # reverted: DecodeCudaGraphRunner.__init__ hardcodes capture_forward_
+        # mode=TARGET_VERIFY for ANY draft worker under ANY speculative algorithm
+        # (model_executor/runner/decode_cuda_graph_runner.py ~L249-251), an
+        # EAGLE-shaped assumption our plain recurrent per-step draft doesn't
+        # match — RuntimeError("This should not happen") since RwkvSpecAlgo
+        # doesn't (and semantically shouldn't) implement supports_target_verify_
+        # for_draft. See project-spec-decode.md 2026-07-07 entry for the two
+        # real paths forward (custom capture vs. shared-file surgery) — this
+        # needs a repo-wide-impact decision, not a quick fix, so left for a
+        # dedicated follow-up rather than pushed through here.
         server_args.context_length = self.target_runner.model_config.context_len
         with _preserve(server_args, "disable_cuda_graph", True):
             self._draft = TpModelWorker(
@@ -255,6 +265,8 @@ class RwkvSpecWorker(BaseSpecWorker):
         # above) -- calling capture_decode_cuda_graph=False since the draft
         # was constructed with disable_cuda_graph=True (never captures for
         # real; this call exists purely for the eager_runner side effect).
+        # Tried capture_decode_cuda_graph=True as the ADR-0006 (ii) speed
+        # lever and reverted it -- see the __init__ comment above for why.
         self._draft.init_cuda_graphs(capture_decode_cuda_graph=False)
 
     # ---- the V2 entry point ------------------------------------------------ #
