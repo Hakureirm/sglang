@@ -100,6 +100,33 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape[-2:]
         )
         self.scale = 1.0
+        # Verify-mode (spec-decode TARGET_VERIFY) per-pool-slot lookup used by
+        # the K-step intermediate-state capture in token_shift/recurrence below;
+        # GDN/KDA set up the same thing (gdn_backend.py). Identity over slot ids.
+        self.verify_intermediate_state_indices = torch.arange(
+            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        )
+
+    def try_fused_shift_lerp6(self, x, layer_id, conv_idx, mix6_buf, forward_batch):
+        """Opt-out stub for the model's "R2 fused paged shift+lerp6" fast path
+        (models/rwkv7.py ~L671): unrelated to spec-decode, but this backend
+        never implemented the fused kernel, and the call site had no
+        hasattr/try-except guard -- so ANY fp16 decode-mode forward (spec or
+        not) hit an AttributeError here the first time this code path was
+        actually exercised (found while wiring RWKV_SPEC's draft decode).
+        Returning None is the documented fallback contract at the call site
+        ("Falls back to token_shift + fused_lerp6 when ineligible") -- this
+        opts out of the fast path unconditionally rather than crashing; a real
+        fused implementation is separate follow-up work, not part of spec-decode.
+        """
+        return None
+
+    def try_fused_shift_lerp1(self, x, layer_id, conv_idx, x_k, forward_batch):
+        """Same opt-out stub as try_fused_shift_lerp6 above, for the FFN
+        (channel-mix) block's single-coefficient fused shift+lerp
+        (models/rwkv7.py ~L828). Same missing-method gap, same fallback
+        contract (`if xk is None: token_shift + torch lerp`)."""
+        return None
 
     # ---- token-shift (width-2 causal shift via the conv state) ----
     def token_shift(
@@ -131,6 +158,45 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
             prev = conv[safe_idx, :, 0]  # [n, hidden]
             conv[safe_idx, :, 0] = x.to(conv.dtype)
             return prev.to(x.dtype)
+
+        if forward_batch.forward_mode.is_target_verify():
+            # K draft-token chain (topk=1 -> no branching, RwkvSpecWorker):
+            # candidates are [t_last, d_0, .., d_{K-2}] per request, packed
+            # request-major. Reuse the exact decode single-step update K times
+            # (same kernel call as the plain baseline at every step -> bit-
+            # identical by construction, no batched-shape reduction-order
+            # divergence -- sidesteps the F0031 class of near-tie flip).
+            # Derived from batch_size (not spec_info.draft_token_num): cuda-
+            # graph capture builds a synthetic TARGET_VERIFY-shaped dummy batch
+            # with spec_info=None (it only knows the token-per-bs count, not a
+            # real NgramVerifyInput), so spec_info must not be load-bearing here.
+            bs = forward_batch.batch_size
+            K = x.shape[0] // bs
+            x_r = x.view(bs, K, -1)
+            safe_idx = torch.clamp_min(cache_indices[:bs], 0)  # pool slots (persistent conv[])
+            # intermediate_conv_window is indexed by REQUEST ORDINAL (0..bs-1)
+            # within this batch, NOT by pool slot -- confirmed against
+            # _fused_conv_window_scatter_with_mask_kernel (src_idx = pid_req)
+            # and GDN's own `verify_intermediate_state_indices[:batch_size]`
+            # (arange(pool.size)[:batch_size] == arange(batch_size), not an
+            # identity-over-pool-slots as the name suggests at a glance).
+            req_pos = torch.arange(bs, device=x.device)
+            shifted = torch.empty_like(x_r)
+            shifted[:, 0] = conv[safe_idx, :, 0].to(x.dtype)
+            if K > 1:
+                shifted[:, 1:] = x_r[:, :-1]
+            # Per-step intermediate snapshot: step t's entry is "what the
+            # persistent state should hold if exactly t+1 positions (0..t) are
+            # accepted" -- i.e. token t's own (post-shift-input) value, since
+            # token_shift's job is "store the current token for the next
+            # shift". update_mamba_state_after_mtp_verify later scatters the
+            # right step back into `conv` based on the real accept length.
+            interm_conv = cache.intermediate_conv_window[conv_idx]  # [size+1, K, hidden, 1]
+            interm_conv[req_pos, :, :, 0] = x_r.to(interm_conv.dtype)
+            # Persistent state: provisionally advance as if all K accepted;
+            # the scatter above corrects it down to the real accept length.
+            conv[safe_idx, :, 0] = x_r[:, -1].to(conv.dtype)
+            return shifted.reshape(x.shape[0], -1)
 
         # extend (packed B=1, varlen via query_start_loc)
         qsl = md.query_start_loc.to(torch.long)
@@ -193,6 +259,48 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
             )
             return o.squeeze(1)  # [bs, H, V]
+
+        if forward_batch.forward_mode.is_target_verify():
+            # Mirror token_shift's is_target_verify branch: K sequential calls
+            # to the SAME in-place indexed decode kernel (one chain position
+            # per call, batched across requests), capturing each step's
+            # resulting state into intermediate_ssm for later selective
+            # commit. Chaining the decode kernel K times, rather than one
+            # batched extend-shaped call, is what makes this bit-identical to
+            # the M=1 baseline (see the token_shift comment above).
+            # Derived from batch_size, not spec_info -- see token_shift's
+            # identical comment (cuda-graph capture's dummy batch has no
+            # real spec_info to read draft_token_num off).
+            bs = forward_batch.batch_size
+            K = r.shape[0] // bs
+            H, Kd, V = r.shape[-2], r.shape[-1], v.shape[-1]
+            r_r, w_r, k_r, kk_r, a_r = (
+                t.view(bs, K, H, Kd) for t in (r, w, k, kk, a)
+            )
+            v_r = v.view(bs, K, H, V)
+            safe_idx = torch.clamp_min(cache_indices[:bs], 0)  # pool slots (persistent temporal[])
+            # intermediate_ssm is indexed by REQUEST ORDINAL (0..bs-1), not by
+            # pool slot -- see token_shift's identical comment/reasoning
+            # (confirmed against _fused_mamba_state_scatter_with_mask_kernel's
+            # `src_idx = pid_req`).
+            req_pos = torch.arange(bs, device=r.device)
+            interm_ssm = cache.intermediate_ssm  # [size+1, K, H, Kd, V]
+            out = torch.empty(bs, K, H, V, dtype=v.dtype, device=v.device)
+            for step in range(K):
+                o, _ = wkv_recurrent(
+                    r_r[:, step].unsqueeze(1).contiguous(),
+                    w_r[:, step].unsqueeze(1).contiguous(),
+                    k_r[:, step].unsqueeze(1).contiguous(),
+                    v_r[:, step].unsqueeze(1).contiguous(),
+                    kk_r[:, step].unsqueeze(1).contiguous(),
+                    a_r[:, step].unsqueeze(1).contiguous(),
+                    scale=self.scale,
+                    state_pool=temporal,
+                    cache_indices=cache_indices[:bs],
+                )
+                out[:, step] = o.squeeze(1)
+                interm_ssm[req_pos, step] = temporal[safe_idx]
+            return out.reshape(bs * K, H, V)
 
         # extend: packed B=1, varlen -> the same recurrent triton kernel.
         # Same pad convention as token_shift (fresh-slot zeroing likewise
