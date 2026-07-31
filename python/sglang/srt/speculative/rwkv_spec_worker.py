@@ -182,6 +182,15 @@ class RwkvSpecWorker(BaseSpecWorker):
         self.k = int(server_args.speculative_num_draft_tokens or 4)
         self.speculative_num_draft_tokens = self.k
 
+        # Concurrency limit, enforced per round in _verify_round rather than
+        # here: this worker drives ONE request's chain at a time (the snapshot
+        # buffers, the hand-rolled draft/verify graphs and the rollback
+        # bookkeeping are all bs=1 and worker-shared — grep "bs=1" in this
+        # file), but `max_running_requests` is a capacity, not a promise that
+        # the capacity gets used, and every working single-stream deployment we
+        # have passes 32. Checking capacity would reject configurations that
+        # are fine; checking the actual batch catches exactly the broken case.
+
         # The draft loads speculative_draft_model_path (TpModelWorker resolves it
         # via is_draft_worker). Force its context to the target's. Keep the
         # DRAFT'S OWN TpModelWorker built with disable_cuda_graph=True always —
@@ -387,6 +396,23 @@ class RwkvSpecWorker(BaseSpecWorker):
     def _verify_round(self, batch, on_publish):
         import os as _os
         import time as _time
+
+        # One request per round, by construction (see __init__). Past this point
+        # every buffer is bs=1 and worker-shared, so a batch of 2+ walks off the
+        # end of the snapshot stack and the process dies on an asynchronous
+        # illegal memory access at whatever sync point comes next — the failure
+        # F0077 attributed to adaptive K, which a 240-request concurrent soak
+        # reproduces with a fixed chain length too. Refusing here turns a
+        # corrupt-then-crash into a message that says what to do.
+        _bs = len(getattr(batch, "reqs", ()) or ())
+        if _bs > 1:
+            raise NotImplementedError(
+                f"RWKV_SPEC got a verify batch of {_bs} requests, but the chain "
+                "machinery is single-request (bs=1 snapshot buffers and CUDA "
+                "graphs, shared across the worker). Drive one request at a time, "
+                "or launch without --speculative-algorithm RWKV_SPEC. Batching "
+                "the draft chain is tracked as follow-up work. (F0078)"
+            )
 
         _timing = _os.environ.get("RWKV_SPEC_TIMING", "0") == "1"
 
@@ -1363,6 +1389,17 @@ class RwkvSpecWorker(BaseSpecWorker):
                 extend_lens=[n],
                 prefix_lens=[prefix_len],
                 extend_logprob_start_lens=[0],
+                # MUST be overridden, not inherited. ForwardBatch.init_new feeds it to
+                # compute_position as `extend_seq_lens_sum`, and compute_position_triton
+                # allocates `torch.empty(that_sum)` while the kernel only fills what the
+                # per-sequence lengths cover. Inheriting the target batch's value gives
+                # the draft a positions tensor sized for the TARGET's token count with
+                # an uninitialized tail, which the cuda-graph buffer registry then tries
+                # to copy into a destination sliced to the draft's own length.
+                # Invisible at bsz1 (the two counts coincide); with 8 concurrent
+                # requests the target prefills ~105 tokens while this draft chunk is 6,
+                # and the server dies on the first prefill.
+                extend_num_tokens=n,
             )
         draft_batch = dataclasses.replace(batch, **overrides)
         return ForwardBatch.init_new(draft_batch, runner)
