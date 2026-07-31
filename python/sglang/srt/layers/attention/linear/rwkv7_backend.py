@@ -19,6 +19,7 @@ is still driven through HybridLinearAttnBackend, so `self.forward_metadata`
 (query_start_loc + mamba_cache_indices) is populated normally.
 """
 
+import os
 from typing import Optional
 
 import torch
@@ -34,6 +35,12 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.rwkv7_kernels import wkv_recurrent
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+
+# R2 fused paged token-shift + lerp glue. Without it the shift is a torch
+# gather/scatter pair per block (index + index_put_ + copies), which on the
+# 7.2B decode step costs ~880 us — the whole gap between this line and the
+# 0.5.10 flagship (F0078).
+_FUSED_GLUE = os.environ.get("RWKV_FUSED_GLUE", "0") == "1"
 
 
 class Rwkv7NoOpFullAttnBackend(AttentionBackend):
@@ -107,26 +114,64 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
+    def _fused_glue_conv(self, layer_id, conv_idx, normed, forward_batch):
+        """Shared eligibility check for the fused shift+lerp glue (R2). Returns
+        (conv, cache_indices) when eligible (RWKV_FUSED_GLUE, decode, fp16 normed,
+        fp32 contiguous conv, int32 contiguous cache_indices, glue built), else
+        None so the caller falls back to token_shift + fused_lerp*.
+
+        The kernel takes the raw cache_indices, pad slots (-1) included: it is
+        byte-gated on the pad-slot and duplicate-index cases (bench/test_glue.py),
+        unlike torch advanced indexing, which is why token_shift below has to
+        clamp and this does not."""
+        if not (
+            _FUSED_GLUE
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and normed.dtype == torch.float16
+        ):
+            return None
+        conv = self.req_to_token_pool.mamba2_layer_cache(layer_id).conv[conv_idx]
+        if conv.dtype != torch.float32 or not conv.is_contiguous():
+            return None
+        ci = self.forward_metadata.mamba_cache_indices
+        if ci.dtype != torch.int32 or not ci.is_contiguous():
+            return None
+        from sglang.srt.layers.attention.rwkv7_kernels import glue
+
+        if not glue.available():
+            return None
+        return conv, ci
+
     def try_fused_shift_lerp6(self, x, layer_id, conv_idx, mix6_buf, forward_batch):
-        """Opt-out stub for the model's "R2 fused paged shift+lerp6" fast path
-        (models/rwkv7.py ~L671): unrelated to spec-decode, but this backend
-        never implemented the fused kernel, and the call site had no
-        hasattr/try-except guard -- so ANY fp16 decode-mode forward (spec or
-        not) hit an AttributeError here the first time this code path was
-        actually exercised (found while wiring RWKV_SPEC's draft decode).
-        Returning None is the documented fallback contract at the call site
-        ("Falls back to token_shift + fused_lerp6 when ineligible") -- this
-        opts out of the fast path unconditionally rather than crashing; a real
-        fused implementation is separate follow-up work, not part of spec-decode.
-        """
-        return None
+        """Fused paged token-shift + 6-way lerp -> lp6[6,T,H], or None (fallback).
+        Byte-exact vs token_shift + fused_lerp6 (bench/test_glue.py).
+
+        This used to be an unconditional `return None` stub: the backend was
+        ported without the glue, and the model's call site treats None as the
+        documented fallback, so the line ran correct-but-slow with nothing
+        announcing it. The profile is what surfaced it — 0.5.10 issues
+        shift_lerp6/shift_lerp1 once per block, this line issued a torch
+        index + index_put_ + two copies instead (F0078)."""
+        e = self._fused_glue_conv(layer_id, conv_idx, x, forward_batch)
+        if e is None or mix6_buf.dtype != torch.float16:
+            return None
+        conv, ci = e
+        from sglang.srt.layers.attention.rwkv7_kernels import glue
+
+        return glue.shift_lerp6(x.contiguous(), mix6_buf, ci, conv)
 
     def try_fused_shift_lerp1(self, x, layer_id, conv_idx, x_k, forward_batch):
-        """Same opt-out stub as try_fused_shift_lerp6 above, for the FFN
-        (channel-mix) block's single-coefficient fused shift+lerp
-        (models/rwkv7.py ~L828). Same missing-method gap, same fallback
-        contract (`if xk is None: token_shift + torch lerp`)."""
-        return None
+        """Fused paged token-shift + 1-way lerp -> xk[T,H], or None (fallback).
+        The FFN (channel-mix) counterpart of try_fused_shift_lerp6."""
+        e = self._fused_glue_conv(layer_id, conv_idx, x, forward_batch)
+        if e is None or x_k.dtype != torch.float16:
+            return None
+        conv, ci = e
+        from sglang.srt.layers.attention.rwkv7_kernels import glue
+
+        return glue.shift_lerp1(
+            x.contiguous(), x_k.reshape(-1).contiguous(), ci, conv
+        )
 
     # ---- token-shift (width-2 causal shift via the conv state) ----
     def token_shift(
