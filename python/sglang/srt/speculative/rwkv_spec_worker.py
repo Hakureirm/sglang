@@ -302,6 +302,32 @@ class RwkvSpecWorker(BaseSpecWorker):
             # draft's own state so the round invariant holds at first decode.
             batch_result = self._target_worker.forward_batch_generation(batch)
             self._mirror_prefill_into_draft(batch)
+            # Merge-safety contract (mirrors NGRAMWorker's prefill return): the
+            # non-overlap spec scheduler assigns batch.spec_info from this
+            # result, and ScheduleBatch.merge_batch calls
+            # running.spec_info.merge_batch(prefill.spec_info) when a freshly
+            # prefilled request joins an active decode batch. A None here dies
+            # inside NgramVerifyInput.merge_batch -- latent until requests
+            # actually overlap, which sequential gate runs never exercised.
+            from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+            bs = len(batch.reqs)
+            predict = batch_result.next_token_ids
+            accept_lens = torch.ones(bs, dtype=torch.int32, device=predict.device)
+            accept_tokens = torch.zeros(
+                bs, self.k, dtype=torch.int32, device=predict.device
+            )
+            accept_tokens[:, 0] = predict
+            new_seq_lens = batch.seq_lens.clone()
+            batch_result.next_draft_input = NgramVerifyInput(
+                draft_token_num=self.k,
+                new_seq_lens=new_seq_lens,
+                accept_tokens=accept_tokens.flatten(),
+                accept_lens=accept_lens,
+            )
+            batch_result.accept_lens = accept_lens
+            batch_result.new_seq_lens = new_seq_lens
+            batch_result.speculative_num_draft_tokens = self.k
             return batch_result
 
         return self._verify_round(batch, on_publish)
@@ -340,6 +366,38 @@ class RwkvSpecWorker(BaseSpecWorker):
     # ---- Strategy B: draft-glue + reuse upstream verify -------------------- #
 
     def _verify_round(self, batch, on_publish):
+        import os as _os
+        import time as _time
+
+        _timing = _os.environ.get("RWKV_SPEC_TIMING", "0") == "1"
+
+        def _mark(phase, t0):
+            if not _timing:
+                return 0.0
+            torch.cuda.synchronize()
+            now = _time.perf_counter()
+            acc = getattr(self, "_t_acc", None)
+            if acc is None:
+                acc = {}
+                self._t_acc = acc
+                self._t_rounds = 0
+            acc[phase] = acc.get(phase, 0.0) + (now - t0)
+            return now
+
+        t0 = 0.0
+        if _timing:
+            torch.cuda.synchronize()
+            t0 = _time.perf_counter()
+            last_exit = getattr(self, "_t_last_exit", None)
+            if last_exit is not None and (t0 - last_exit) < 0.2:
+                # gaps above 200 ms are idle time between requests, not
+                # per-round scheduler glue -- exclude them from the average
+                acc = getattr(self, "_t_acc", None)
+                if acc is None:
+                    acc = {}
+                    self._t_acc = acc
+                    self._t_rounds = 0
+                acc["scheduler_gap"] = acc.get("scheduler_gap", 0.0) + (t0 - last_exit)
         from sglang.srt.managers.scheduler import GenerationBatchResult
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -373,6 +431,8 @@ class RwkvSpecWorker(BaseSpecWorker):
             all_tokens.append(t_last)
             all_tokens.extend(drafts)
             snaps_per_req.append(snaps)
+
+        t0 = _mark("draft", t0)
 
         draft_token = torch.tensor(all_tokens, dtype=torch.int64, device=dev)
 
@@ -425,11 +485,39 @@ class RwkvSpecWorker(BaseSpecWorker):
         # init_new reads it via getattr with a NULL default).
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
 
+        t0 = _mark("prep", t0)
+
         # 3) reuse upstream verify + commit — the whole point of Strategy B.
-        batch_result = self._target_worker.forward_batch_generation(
-            batch, is_verify=True
+        #    Graphed when possible: the eager TARGET_VERIFY forward is the
+        #    round's dominant cost (launch-bound small kernels), and the
+        #    capture-replay idiom is the same one the draft graph already
+        #    proved. The real per-round spec_info above still feeds
+        #    eagle_sample/commit below either way.
+        use_vgraph = (
+            bs == 1
+            and not getattr(batch, "return_logprob", False)
+            and self._ensure_verify_graph(batch)
         )
-        logits_output = batch_result.logits_output
+        if not getattr(self, "_vpath_logged", False):
+            self._vpath_logged = True
+            logger.info("RWKV_SPEC verify path this run: %s", "GRAPH" if use_vgraph else "EAGER")
+        if use_vgraph:
+            io = self._verify_graph_io
+            io["req_pool_indices"].copy_(batch.req_pool_indices)
+            io["seq_lens"].copy_(batch.seq_lens)
+            io["input_ids"].copy_(draft_token)
+            io["positions"].copy_(positions)
+            io["out_cache_loc"].copy_(batch.out_cache_loc)
+            self._verify_graph.replay()
+            logits_output = io["out"].logits_output
+            verify_can_run_cuda_graph = False
+        else:
+            batch_result = self._target_worker.forward_batch_generation(
+                batch, is_verify=True
+            )
+            logits_output = batch_result.logits_output
+            verify_can_run_cuda_graph = batch_result.can_run_cuda_graph
+        t0 = _mark("target_fwd", t0)
         # The generic LogitsProcessor projects all bs*K verify rows through ONE
         # batched matmul; cuBLAS's reduction order for that M-shape can differ
         # from the M=1 GEMV the plain decode baseline uses, flipping a near-tie
@@ -447,6 +535,7 @@ class RwkvSpecWorker(BaseSpecWorker):
             ],
             dim=0,
         )
+        t0 = _mark("head_recompute", t0)
         predict, accept_lens, accept_index = eagle_sample(
             batch.spec_info, batch, logits_output, None
         )
@@ -489,6 +578,8 @@ class RwkvSpecWorker(BaseSpecWorker):
             batch, accept_index, num_correct_drafts, self.token_to_kv_pool_allocator
         )
 
+        t0 = _mark("sample_commit", t0)
+
         # 4) NEW: roll back the draft's own state to the accepted length
         #    (checkpoint-and-commit — the one genuinely new piece of logic
         #    here; the target's rollback above is upstream's, for free).
@@ -507,6 +598,23 @@ class RwkvSpecWorker(BaseSpecWorker):
         if on_publish is not None:
             on_publish(new_seq_lens)
 
+        t0 = _mark("rollback_glue", t0)
+        if _timing:
+            self._t_last_exit = _time.perf_counter()
+            self._t_rounds += 1
+            if self._t_rounds % 50 == 0:
+                total = sum(self._t_acc.values())
+                parts = "  ".join(
+                    f"{k}={v * 1000 / self._t_rounds:.2f}ms({v / total * 100:.0f}%)"
+                    for k, v in sorted(self._t_acc.items(), key=lambda kv: -kv[1])
+                )
+                logger.info(
+                    "RWKV_SPEC timing over %d rounds: total %.2f ms/round | %s",
+                    self._t_rounds,
+                    total * 1000 / self._t_rounds,
+                    parts,
+                )
+
         next_draft_input = NgramVerifyInput(
             draft_token_num=K,
             new_seq_lens=new_seq_lens,
@@ -516,7 +624,7 @@ class RwkvSpecWorker(BaseSpecWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
-            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            can_run_cuda_graph=verify_can_run_cuda_graph,
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
             next_draft_input=next_draft_input,
@@ -543,28 +651,124 @@ class RwkvSpecWorker(BaseSpecWorker):
         # fails, so this can never regress correctness, only speed.
         use_graph = self._ensure_draft_decode_graph(batch, req)
 
-        snaps = [_snapshot(self.draft_pool, self.draft_layers, d_mslot)]
+        use_stacked = use_graph and len(batch.reqs) == 1
+        if use_stacked:
+            # Stacked snapshot buffers: one preallocated [K, L, ...] tensor per
+            # state kind, written slice-by-slice -- per-layer copies without
+            # clone allocations or torch.stack cats. Restore is the mirror
+            # copy. bs=1 only: the buffers are worker-shared, and rollback
+            # happens after ALL requests' chains, so a second request's chain
+            # would overwrite the first's snapshots.
+            bufs = getattr(self, "_snap_bufs", None)
+            if bufs is None:
+                pool = self.draft_pool
+                caches = [pool.mamba2_layer_cache(lid) for lid in self.draft_layers]
+                L = len(caches)
+                c0 = caches[0]
+                bufs = dict(
+                    conv0=torch.empty(
+                        (self.k, L) + tuple(c0.conv[0].shape[1:]),
+                        dtype=c0.conv[0].dtype,
+                        device=c0.conv[0].device,
+                    ),
+                    conv1=torch.empty(
+                        (self.k, L) + tuple(c0.conv[1].shape[1:]),
+                        dtype=c0.conv[1].dtype,
+                        device=c0.conv[1].device,
+                    ),
+                    temporal=torch.empty(
+                        (self.k, L) + tuple(c0.temporal.shape[1:]),
+                        dtype=c0.temporal.dtype,
+                        device=c0.temporal.device,
+                    ),
+                    caches=caches,
+                )
+                self._snap_bufs = bufs
+
+            def _snap_into(j):
+                for i, cache in enumerate(bufs["caches"]):
+                    bufs["conv0"][j, i].copy_(cache.conv[0][d_mslot])
+                    bufs["conv1"][j, i].copy_(cache.conv[1][d_mslot])
+                    bufs["temporal"][j, i].copy_(cache.temporal[d_mslot])
+
+            snaps = ("stacked", bufs, d_mslot)
+        else:
+            snaps = []
+        if use_graph:
+            pass
+            # Chained replay with NO per-step host sync: each step's argmax is
+            # computed on-GPU and copied straight into the graph's static
+            # input buffer for the next replay (device-to-device, stream-
+            # ordered). The eager path below still syncs per step -- that is
+            # the gated fallback, unchanged. One .tolist() at the end fetches
+            # the whole chain.
+            io = self._draft_graph_io
+            d_toks = getattr(self, "_d_toks", None)
+            if d_toks is None or d_toks.numel() < self.k - 1:
+                d_toks = torch.empty(
+                    max(1, self.k - 1),
+                    dtype=torch.int64,
+                    device=self.draft_runner.device,
+                )
+                self._d_toks = d_toks
+            io["req_pool_indices"].fill_(draft_req_idx)
+            io["input_ids"].fill_(t_last)
+            # K replays over cand=[t_last, d_0..d_{K-2}]: replay m consumes
+            # cand[m]. Snapshot AFTER each replay, so snaps[m] = the state
+            # having consumed cand[0..m] = (t_last, d_0..d_{m-1}) -- exactly
+            # the rollback target when m drafts are accepted, for EVERY
+            # m=0..K-1 including full accept. The previous scheme snapped
+            # before the first replay and ran only K-1 replays: every
+            # rollback (and even the full-accept no-op) left the draft state
+            # one committed token short, permanently desyncing it. The gate
+            # never noticed -- draft state only shapes proposals, never the
+            # target's committed tokens -- but measured accept-length sat at
+            # ~1.2 against an independently measured alpha of ~0.7. The K-th
+            # replay's own prediction is unused; its STATE is the point.
+            for step in range(self.k):
+                ocl = self.draft_runner.token_to_kv_pool_allocator.alloc(1)
+                io["seq_lens"].fill_(cur_len + step + 1)
+                io["out_cache_loc"].copy_(ocl)
+                self._draft_graph.replay()
+                if use_stacked:
+                    _snap_into(step)
+                else:
+                    snaps.append(
+                        _snapshot(self.draft_pool, self.draft_layers, d_mslot)
+                    )
+                if step < self.k - 1:
+                    logits = io["out"].logits_output.next_token_logits
+                    d_toks[step : step + 1] = torch.argmax(logits, dim=-1)
+                    io["input_ids"].copy_(d_toks[step : step + 1])
+            drafts = [int(t) for t in d_toks[: self.k - 1].tolist()]
+            return drafts, snaps
         drafts: List[int] = []
         tok = t_last
-        for step in range(self.k - 1):
-            if use_graph:
-                logits = self._draft_decode_one_logits_graphed(
-                    draft_req_idx, tok, cur_len + step + 1
-                )
-            else:
-                logits = self._draft_decode_one_logits(
-                    batch, req, draft_req_idx, tok, cur_len + step
-                )
-            nxt = int(torch.argmax(logits, dim=-1))
-            drafts.append(nxt)
-            tok = nxt
+        for step in range(self.k):
+            logits = self._draft_decode_one_logits(
+                batch, req, draft_req_idx, tok, cur_len + step
+            )
+            # Same K-replay, post-forward snapshot ordering as the graphed
+            # path above (the last step's prediction is unused; its state is
+            # the full-accept rollback target).
             snaps.append(_snapshot(self.draft_pool, self.draft_layers, d_mslot))
+            if step < self.k - 1:
+                nxt = int(torch.argmax(logits, dim=-1))
+                drafts.append(nxt)
+                tok = nxt
         return drafts, snaps
 
     def _commit_draft_rollback(self, snaps, num_accepted):
         """Restore the draft's own recurrent state to the checkpoint matching
         exactly `num_accepted` (0..K-1) accepted draft steps. A no-op copy
         when num_accepted == K-1 (current state already matches)."""
+        if isinstance(snaps, tuple) and snaps and snaps[0] == "stacked":
+            _, bufs, slot = snaps
+            for i, cache in enumerate(bufs["caches"]):
+                cache.conv[0][slot].copy_(bufs["conv0"][num_accepted, i])
+                cache.conv[1][slot].copy_(bufs["conv1"][num_accepted, i])
+                cache.temporal[slot].copy_(bufs["temporal"][num_accepted, i])
+            return
         _restore(self.draft_pool, self.draft_layers, snaps[num_accepted])
 
     # ---- draft pool slot mgmt --------------------------------------------- #
@@ -669,6 +873,186 @@ class RwkvSpecWorker(BaseSpecWorker):
         import os
 
         return os.environ.get("RWKV_SPEC_DRAFT_GRAPH", "1") != "0"
+
+    # ---- target-verify CUDA graph (same idiom as the draft graph) ----------- #
+    #
+    # The TARGET_VERIFY forward is the round's dominant cost once the draft is
+    # graphed: an eager 24-layer pass over K positions plus the backend's
+    # K-step recurrence loop -- all small kernels, launch-bound. Same cure as
+    # the draft: one hand-rolled, self-contained CUDA graph owned by this
+    # file, capturing exactly `model_runner.forward(fb)` for the bs=1
+    # TARGET_VERIFY shape. Everything with side effects that cannot replay
+    # (assign_extend_cache_locs_func's req_to_token writes, mamba-track prep)
+    # stays eager per round, feeding static buffers the graph reads.
+    #
+    # bs=1 only (matches the rest of this worker's chain design); falls back
+    # permanently to the eager verify on any capture failure, or via
+    # RWKV_SPEC_VERIFY_GRAPH=0, or per-round when return_logprob is requested
+    # (the template bakes return_logprob=False).
+
+    def _verify_graph_enabled(self) -> bool:
+        import os
+
+        return os.environ.get("RWKV_SPEC_VERIFY_GRAPH", "1") != "0"
+
+    def _ensure_verify_graph(self, batch) -> bool:
+        if getattr(self, "_verify_graph", None) is not None:
+            return True
+        if getattr(self, "_verify_graph_failed", False):
+            return False
+        if not self._verify_graph_enabled() or len(batch.reqs) != 1:
+            self._verify_graph_failed = True
+            return False
+        try:
+            self._build_verify_graph(batch)
+            logger.info("RWKV_SPEC: target-verify CUDA graph captured OK")
+            return True
+        except Exception:
+            logger.warning(
+                "RWKV_SPEC: target-verify CUDA graph capture failed -- falling "
+                "back to eager verify for the rest of this run",
+                exc_info=True,
+            )
+            self._verify_graph = None
+            self._verify_graph_io = None
+            self._verify_graph_failed = True
+            return False
+
+    def _build_verify_graph(self, batch) -> None:
+        import dataclasses
+        import types
+
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+        )
+        from sglang.srt.speculative.ngram_info import NgramVerifyInput
+        from sglang.srt.speculative.triton_ops.cache_locs import (
+            assign_extend_cache_locs_func,
+        )
+
+        runner = self.target_runner
+        dev = runner.device
+        K = self.k
+        req = batch.reqs[0]
+
+        # Dedicated scratch slot on the TARGET pool for warmup/capture practice
+        # forwards, so they never touch a real request's recurrent state.
+        pool = self.target_pool
+        shim = types.SimpleNamespace(
+            rid="__rwkv_spec_verify_graph_scratch__",
+            req_pool_idx=None,
+            mamba_pool_idx=None,
+        )
+        scratch_idx = int(pool.alloc([shim])[0])
+        self._verify_scratch_shim = shim
+
+        g_input_ids = torch.zeros(K, dtype=torch.int64, device=dev)
+        g_positions = torch.zeros(K, dtype=torch.int64, device=dev)
+        g_seq_lens = torch.zeros(1, dtype=torch.int64, device=dev)
+        g_req_pool_indices = torch.full((1,), scratch_idx, dtype=torch.int64, device=dev)
+        g_out_cache_loc = torch.zeros(K, dtype=torch.int64, device=dev)
+        g_seq_lens_cpu_dummy = torch.zeros(1, dtype=torch.int64)
+
+        # Chain-shape constants for bs=1: identical every round by construction
+        # (see _verify_round), so they are baked as real tensors, not rebuilt.
+        idx = torch.arange(K, device=dev, dtype=torch.int64).view(1, K)
+        retrieve_next_token = torch.cat(
+            [idx[:, 1:], torch.full((1, 1), -1, dtype=torch.int64, device=dev)], dim=1
+        )
+        retrieve_next_sibling = torch.full((1, K), -1, dtype=torch.int64, device=dev)
+        custom_mask = torch.ones(K, dtype=torch.bool, device=dev)
+
+        spec_info = NgramVerifyInput(
+            draft_token=g_input_ids,
+            custom_mask=custom_mask,
+            positions=g_positions,
+            retrieve_index=idx,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            draft_token_num=K,
+        )
+        spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+
+        cur_len = len(req.origin_input_ids) + len(req.output_ids)
+
+        def _one_verify(seq_len_val):
+            g_seq_lens.fill_(seq_len_val)
+            overrides = dict(
+                reqs=[req],
+                req_to_token_pool=runner.req_to_token_pool,
+                token_to_kv_pool_allocator=runner.token_to_kv_pool_allocator,
+                req_pool_indices=g_req_pool_indices,
+                input_ids=g_input_ids,
+                seq_lens=g_seq_lens,
+                seq_lens_sum=int(seq_len_val),
+                seq_lens_cpu=g_seq_lens_cpu_dummy,
+                out_cache_loc=g_out_cache_loc,
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                spec_info=spec_info,
+                sampling_info=None,
+                capture_hidden_mode=None,
+                return_hidden_states_before_norm=False,
+                return_logprob=False,
+                top_logprobs_nums=[0],
+                token_ids_logprobs=[None],
+            )
+            verify_batch = dataclasses.replace(batch, **overrides)
+            fb = ForwardBatch.init_new(verify_batch, runner)
+            return runner.forward(fb)
+
+        # Eagerly seed out_cache_loc/req_to_token for the scratch slot the way
+        # every real round does, so warmup/capture see the true code path.
+        def _seed_cache_locs(seq_len_val):
+            locs = assign_extend_cache_locs_func(
+                req_pool_indices=g_req_pool_indices,
+                req_to_token=runner.req_to_token_pool.req_to_token,
+                start_offset=g_seq_lens,
+                end_offset=g_seq_lens + K,
+                batch_size=1,
+                draft_token_num=K,
+                device=dev,
+            )
+            g_out_cache_loc.copy_(locs)
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for i in range(5):
+                g_seq_lens.fill_(cur_len + 1 + i)
+                _seed_cache_locs(cur_len + 1 + i)
+                _one_verify(cur_len + 1 + i)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        g = torch.cuda.CUDAGraph()
+        g_seq_lens.fill_(cur_len + 6)
+        _seed_cache_locs(cur_len + 6)
+        with torch.cuda.graph(g):
+            static_out = _one_verify(cur_len + 6)
+
+        self._verify_graph = g
+        self._verify_graph_io = dict(
+            input_ids=g_input_ids,
+            positions=g_positions,
+            seq_lens=g_seq_lens,
+            req_pool_indices=g_req_pool_indices,
+            out_cache_loc=g_out_cache_loc,
+            out=static_out,
+        )
+        # Return the scratch slot: replay reads req_pool_indices' CONTENTS, so
+        # the scratch row is only ever touched during warmup/capture. Holding
+        # it would trip the scheduler's idle-time req_to_token_pool leak check
+        # (all-slots-free invariant) after the first request completes.
+        try:
+            if getattr(shim, "mamba_pool_idx", None) is not None:
+                pool.free_mamba_cache(shim)
+            pool.free(shim)
+        except Exception:
+            logger.warning(
+                "RWKV_SPEC: verify-graph scratch slot free failed", exc_info=True
+            )
+        self._verify_scratch_shim = None
 
     def _ensure_draft_decode_graph(self, batch, req) -> bool:
         """Lazily build (once) the bs=1/n=1 DECODE-mode CUDA graph for the
