@@ -614,16 +614,23 @@ class RwkvSpecWorker(BaseSpecWorker):
         # via this same per-row recompute). Overwrite next_token_logits with a
         # per-row [1,H]@[H,V] projection -- identical reduction order to M=1
         # decode -- before sampling, so verify and baseline agree bit-for-bit.
-        w = self.target_runner.model.lm_head.weight
-        vocab = self.target_runner.model_config.vocab_size
-        h = logits_output.hidden_states.to(w.dtype)
-        logits_output.next_token_logits = torch.cat(
-            [
-                torch.matmul(h[i : i + 1], w.t()).float()[:, :vocab]
-                for i in range(h.shape[0])
-            ],
-            dim=0,
-        )
+        # Skipped under RWKV_FAST_LMHEAD=1: the LogitsProcessor has then already
+        # projected these rows through the shared-weight GEMV, which is bit-identical
+        # per row to the M=1 projection plain decode used, so the invariance this
+        # recompute exists to enforce is structural and repeating it re-reads a
+        # 512 MiB weight for nothing. Measured 1.90 ms/round at M=6 and linear in
+        # bs*K, i.e. the single phase that would sink a batched chain (F0078).
+        if _os.environ.get("RWKV_FAST_LMHEAD", "0") != "1":
+            w = self.target_runner.model.lm_head.weight
+            vocab = self.target_runner.model_config.vocab_size
+            h = logits_output.hidden_states.to(w.dtype)
+            logits_output.next_token_logits = torch.cat(
+                [
+                    torch.matmul(h[i : i + 1], w.t()).float()[:, :vocab]
+                    for i in range(h.shape[0])
+                ],
+                dim=0,
+            )
         t0 = _mark("head_recompute", t0)
         predict, accept_lens, accept_index = eagle_sample(
             batch.spec_info, batch, logits_output, None
