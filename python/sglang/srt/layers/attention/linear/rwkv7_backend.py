@@ -192,7 +192,11 @@ class Rwkv7AttnBackend(MambaAttnBackendBase):
             # shift". update_mamba_state_after_mtp_verify later scatters the
             # right step back into `conv` based on the real accept length.
             interm_conv = cache.intermediate_conv_window[conv_idx]  # [size+1, K, hidden, 1]
-            interm_conv[req_pos, :, :, 0] = x_r.to(interm_conv.dtype)
+            # First K slots only: the buffer's second dim is the SERVER
+            # capacity (speculative_num_draft_tokens); an adaptive round may
+            # run a smaller chain, and the commit scatter only ever reads
+            # step < accept <= K.
+            interm_conv[req_pos, :K, :, 0] = x_r.to(interm_conv.dtype)
             # Persistent state: provisionally advance as if all K accepted;
             # the scatter above corrects it down to the real accept length.
             conv[safe_idx, :, 0] = x_r[:, -1].to(conv.dtype)

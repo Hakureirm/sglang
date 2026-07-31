@@ -76,6 +76,25 @@ from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 
 logger = logging.getLogger(__name__)
 
+def _shared_graph_pool(worker):
+    # One memory pool for EVERY manual capture this worker owns (draft step +
+    # all verify-K variants). Separate private pools per capture is the
+    # documented sharp edge behind rare cross-graph aliasing; sharing one pool
+    # makes later captures allocate on top of earlier graphs' reservations
+    # instead of interleaving with live allocations.
+    pool = getattr(worker, "_graph_mem_pool", None)
+    if pool is None:
+        pool = torch.cuda.graph_pool_handle()
+        worker._graph_mem_pool = pool
+    return pool
+
+
+def _adaptive_enabled() -> bool:
+    import os
+
+    return os.environ.get("RWKV_SPEC_ADAPTIVE", "0") == "1"
+
+
 
 class RwkvSpecAlgo(CustomSpecAlgo):
     """Plugin descriptor: a recurrent draft with NO draft KV cache (like NGRAM),
@@ -419,6 +438,38 @@ class RwkvSpecWorker(BaseSpecWorker):
 
         bs = len(batch.reqs)
         K = self.k
+        # Adaptive K (RWKV_SPEC_ADAPTIVE=1, bs=1): pick this round's chain
+        # length from the request's recent accept EMA. High-accept workloads
+        # (math/code) run K=8 and keep their 2.4x; low-accept prose drops to
+        # K=4 rather than burning draft steps that will be rejected. Server K
+        # is the CAPACITY (buffers, pool windows); the per-round k only
+        # shrinks it, never exceeds.
+        # EXPERIMENTAL, default OFF: with adaptive K the multi-K verify-graph
+        # path dies within a few requests on an async illegal memory access
+        # (fixed-K runs are 40+ requests clean; upfront capture and a shared
+        # graph memory pool were both tried and neither cured it). Gate is
+        # 10/10 and the K distribution verifiably switches while it lives,
+        # so the logic is right and the race is in the multi-graph replay
+        # path. Needs a compute-sanitizer racecheck session before this can
+        # default on.
+        if (
+            bs == 1
+            and _os.environ.get("RWKV_SPEC_ADAPTIVE", "0") == "1"
+        ):
+            ema_map = getattr(self, "_accept_ema", None)
+            if ema_map is None:
+                ema_map = {}
+                self._accept_ema = ema_map
+            ema = ema_map.get(batch.reqs[0].rid, 3.0)
+            K = 8 if ema >= 4.2 else (6 if ema >= 2.1 else 4)
+            K = min(K, self.k)
+            kd = getattr(self, "_k_dist", None)
+            if kd is None:
+                kd = {}
+                self._k_dist = kd
+            kd[K] = kd.get(K, 0) + 1
+            if sum(kd.values()) % 200 == 0:
+                logger.info("RWKV_SPEC adaptive K distribution: %s", dict(sorted(kd.items())))
         dev = batch.seq_lens.device
 
         # 1) draft proposes K-1 tokens per request; position 0 of the verify
@@ -427,7 +478,7 @@ class RwkvSpecWorker(BaseSpecWorker):
         snaps_per_req = []
         for req in batch.reqs:
             t_last = req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
-            drafts, snaps = self._draft_decode_chain(batch, req, t_last)
+            drafts, snaps = self._draft_decode_chain(batch, req, t_last, K)
             all_tokens.append(t_last)
             all_tokens.extend(drafts)
             snaps_per_req.append(snaps)
@@ -496,19 +547,31 @@ class RwkvSpecWorker(BaseSpecWorker):
         use_vgraph = (
             bs == 1
             and not getattr(batch, "return_logprob", False)
-            and self._ensure_verify_graph(batch)
+            and self._ensure_verify_graph(batch, K)
         )
         if not getattr(self, "_vpath_logged", False):
             self._vpath_logged = True
             logger.info("RWKV_SPEC verify path this run: %s", "GRAPH" if use_vgraph else "EAGER")
         if use_vgraph:
-            io = self._verify_graph_io
+            io = self._verify_graphs.get(K)
+            if io is None:
+                # Defensive: _ensure_verify_graph said yes but the entry is
+                # absent -- log the evidence loudly and take the eager path
+                # instead of killing the scheduler. (One unexplained KeyError
+                # was observed here; if this fires again the keys tell why.)
+                logger.warning(
+                    "RWKV_SPEC: verify graph for k=%d missing (have %s) -- eager",
+                    K,
+                    sorted(self._verify_graphs.keys()),
+                )
+                use_vgraph = False
+        if use_vgraph:
             io["req_pool_indices"].copy_(batch.req_pool_indices)
             io["seq_lens"].copy_(batch.seq_lens)
             io["input_ids"].copy_(draft_token)
             io["positions"].copy_(positions)
             io["out_cache_loc"].copy_(batch.out_cache_loc)
-            self._verify_graph.replay()
+            io["graph"].replay()
             logits_output = io["out"].logits_output
             verify_can_run_cuda_graph = False
         else:
@@ -584,10 +647,15 @@ class RwkvSpecWorker(BaseSpecWorker):
         #    (checkpoint-and-commit — the one genuinely new piece of logic
         #    here; the target's rollback above is upstream's, for free).
         num_correct_drafts_cpu = num_correct_drafts.tolist()
+        ema_map = getattr(self, "_accept_ema", None)
         for i, req in enumerate(batch.reqs):
             self._commit_draft_rollback(snaps_per_req[i], num_correct_drafts_cpu[i])
             self._rounds += 1
-            self._accept_sum += num_correct_drafts_cpu[i] + 1
+            accepted = num_correct_drafts_cpu[i] + 1
+            self._accept_sum += accepted
+            if ema_map is not None:
+                prev = ema_map.get(req.rid, 3.0)
+                ema_map[req.rid] = 0.7 * prev + 0.3 * accepted
 
         cur_rids = {req.rid for req in batch.reqs}
         departed_rids = self._prev_decode_rids - cur_rids
@@ -632,7 +700,8 @@ class RwkvSpecWorker(BaseSpecWorker):
             num_correct_drafts_per_req_cpu=num_correct_drafts_cpu,
         )
 
-    def _draft_decode_chain(self, batch, req, t_last) -> tuple:
+    def _draft_decode_chain(self, batch, req, t_last, k=None) -> tuple:
+        k = k if k is not None else self.k
         """K-1 greedy decode steps on the draft's own pool for ONE request.
 
         Returns (drafts: List[int] length K-1, snaps: list of K state
@@ -725,7 +794,7 @@ class RwkvSpecWorker(BaseSpecWorker):
             # target's committed tokens -- but measured accept-length sat at
             # ~1.2 against an independently measured alpha of ~0.7. The K-th
             # replay's own prediction is unused; its STATE is the point.
-            for step in range(self.k):
+            for step in range(k):
                 ocl = self.draft_runner.token_to_kv_pool_allocator.alloc(1)
                 io["seq_lens"].fill_(cur_len + step + 1)
                 io["out_cache_loc"].copy_(ocl)
@@ -736,15 +805,15 @@ class RwkvSpecWorker(BaseSpecWorker):
                     snaps.append(
                         _snapshot(self.draft_pool, self.draft_layers, d_mslot)
                     )
-                if step < self.k - 1:
+                if step < k - 1:
                     logits = io["out"].logits_output.next_token_logits
                     d_toks[step : step + 1] = torch.argmax(logits, dim=-1)
                     io["input_ids"].copy_(d_toks[step : step + 1])
-            drafts = [int(t) for t in d_toks[: self.k - 1].tolist()]
+            drafts = [int(t) for t in d_toks[: k - 1].tolist()]
             return drafts, snaps
         drafts: List[int] = []
         tok = t_last
-        for step in range(self.k):
+        for step in range(k):
             logits = self._draft_decode_one_logits(
                 batch, req, draft_req_idx, tok, cur_len + step
             )
@@ -752,7 +821,7 @@ class RwkvSpecWorker(BaseSpecWorker):
             # path above (the last step's prediction is unused; its state is
             # the full-accept rollback target).
             snaps.append(_snapshot(self.draft_pool, self.draft_layers, d_mslot))
-            if step < self.k - 1:
+            if step < k - 1:
                 nxt = int(torch.argmax(logits, dim=-1))
                 drafts.append(nxt)
                 tok = nxt
@@ -895,30 +964,49 @@ class RwkvSpecWorker(BaseSpecWorker):
 
         return os.environ.get("RWKV_SPEC_VERIFY_GRAPH", "1") != "0"
 
-    def _ensure_verify_graph(self, batch) -> bool:
-        if getattr(self, "_verify_graph", None) is not None:
-            return True
-        if getattr(self, "_verify_graph_failed", False):
-            return False
+    def _ensure_verify_graph(self, batch, k=None) -> bool:
+        k = k if k is not None else self.k
+        graphs = getattr(self, "_verify_graphs", None)
+        if graphs is None:
+            graphs = {}
+            self._verify_graphs = graphs
+        if k in graphs:
+            return graphs[k] is not None
         if not self._verify_graph_enabled() or len(batch.reqs) != 1:
-            self._verify_graph_failed = True
+            graphs[k] = None
             return False
         try:
-            self._build_verify_graph(batch)
-            logger.info("RWKV_SPEC: target-verify CUDA graph captured OK")
+            # Capture every K variant up front on the first request, rather
+            # than lazily mid-serving: each capture creates its own private
+            # allocator pool, and interleaving new captures with live rounds
+            # is exactly the kind of allocator-state interaction that showed
+            # up as a rare async illegal-access. One place, one time.
+            todo = [self.k]
+            if _adaptive_enabled():
+                todo = sorted({4, 6, 8, self.k} & set(range(1, self.k + 1)))
+            for kk in todo:
+                if kk not in graphs:
+                    self._build_verify_graph(batch, kk)
+                    logger.info(
+                        "RWKV_SPEC: target-verify CUDA graph captured OK (k=%d)", kk
+                    )
+            if k not in graphs:
+                self._build_verify_graph(batch, k)
+                logger.info(
+                    "RWKV_SPEC: target-verify CUDA graph captured OK (k=%d)", k
+                )
             return True
         except Exception:
             logger.warning(
-                "RWKV_SPEC: target-verify CUDA graph capture failed -- falling "
-                "back to eager verify for the rest of this run",
+                "RWKV_SPEC: target-verify CUDA graph capture failed (k=%d) -- "
+                "eager verify for this k from now on",
+                k,
                 exc_info=True,
             )
-            self._verify_graph = None
-            self._verify_graph_io = None
-            self._verify_graph_failed = True
+            graphs[k] = None
             return False
 
-    def _build_verify_graph(self, batch) -> None:
+    def _build_verify_graph(self, batch, k=None) -> None:
         import dataclasses
         import types
 
@@ -934,7 +1022,7 @@ class RwkvSpecWorker(BaseSpecWorker):
 
         runner = self.target_runner
         dev = runner.device
-        K = self.k
+        K = k if k is not None else self.k
         req = batch.reqs[0]
 
         # Dedicated scratch slot on the TARGET pool for warmup/capture practice
@@ -1028,11 +1116,11 @@ class RwkvSpecWorker(BaseSpecWorker):
         g = torch.cuda.CUDAGraph()
         g_seq_lens.fill_(cur_len + 6)
         _seed_cache_locs(cur_len + 6)
-        with torch.cuda.graph(g):
+        with torch.cuda.graph(g, pool=_shared_graph_pool(self)):
             static_out = _one_verify(cur_len + 6)
 
-        self._verify_graph = g
-        self._verify_graph_io = dict(
+        self._verify_graphs[K] = dict(
+            graph=g,
             input_ids=g_input_ids,
             positions=g_positions,
             seq_lens=g_seq_lens,
@@ -1182,7 +1270,7 @@ class RwkvSpecWorker(BaseSpecWorker):
 
         g = torch.cuda.CUDAGraph()
         ocl = runner.token_to_kv_pool_allocator.alloc(1)
-        with torch.cuda.graph(g):
+        with torch.cuda.graph(g, pool=_shared_graph_pool(self)):
             static_out = _one_step(ocl, cur_len + 6)
 
         self._draft_graph = g
